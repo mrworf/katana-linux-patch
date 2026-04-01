@@ -22,6 +22,9 @@
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <linux/usb/audio.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/jiffies.h>
 
 #include <sound/asoundef.h>
 #include <sound/core.h>
@@ -4332,6 +4335,410 @@ static int snd_djm_controls_create(struct usb_mixer_interface *mixer,
 	return 0;
 }
 
+/*
+ * Creative Sound Blaster X Katana (0x041e:0x3247) - custom HW volume/mute
+ * The device exposes HW volume/mute on Interface 0, Feature Unit ID 1,
+ * not parsed as expected by the generic mixer for regular paths.
+ * Implement dedicated controls that issue UAC1 Feature Unit requests on EP0.
+ */
+
+/* Deferred volume update state for Katana to coalesce rapid changes */
+#define KATANA_VOL_DELAY_MS	50
+
+struct katana_mixer_state {
+	struct usb_mixer_interface *mixer;
+	struct mutex lock; /* protects fields below */
+	int vol_cached_steps;
+	bool vol_cached_valid;
+	int vol_pending_steps;
+	bool vol_pending;
+	struct delayed_work vol_work;
+};
+
+static inline struct katana_mixer_state *katana_get_state(struct usb_mixer_interface *mixer)
+{
+	return (struct katana_mixer_state *)mixer->private_data;
+}
+
+/* Forward declarations for helper functions used below */
+static inline int katana_uac1_set(struct usb_mixer_interface *mixer,
+                                  int request, u16 wValue,
+                                  void *buf, int len);
+static int katana_get_volume_range(struct usb_mixer_interface *mixer,
+                                   s16 *minv, s16 *maxv, s16 *resv);
+
+static void katana_vol_work_func(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct katana_mixer_state *st = container_of(dwork, struct katana_mixer_state, vol_work);
+	struct usb_mixer_interface *mixer = st->mixer;
+	s16 minv = -20480, maxv = 0, resv = 1, raw;
+	u8 buf[2];
+	int steps, ret;
+
+	if (!mixer || mixer->disconnected)
+		return;
+
+	mutex_lock(&st->lock);
+	if (!st->vol_pending) {
+		mutex_unlock(&st->lock);
+		return;
+	}
+	steps = st->vol_pending_steps;
+	st->vol_pending = false;
+	mutex_unlock(&st->lock);
+
+	katana_get_volume_range(mixer, &minv, &maxv, &resv);
+	if (resv <= 0)
+		resv = 1;
+	raw = minv + (steps * resv);
+	if (raw < minv)
+		raw = minv;
+	if (raw > maxv)
+		raw = maxv;
+
+	buf[0] = (u8)(raw & 0xff);
+	buf[1] = (u8)((raw >> 8) & 0xff);
+
+	ret = katana_uac1_set(mixer, UAC_SET_CUR, (UAC_FU_VOLUME << 8) | 0x01, buf, 2);
+	if (ret >= 0)
+		ret = katana_uac1_set(mixer, UAC_SET_CUR, (UAC_FU_VOLUME << 8) | 0x02, buf, 2);
+
+	mutex_lock(&st->lock);
+	if (ret >= 0) {
+		st->vol_cached_steps = steps;
+		st->vol_cached_valid = true;
+	}
+	mutex_unlock(&st->lock);
+}
+
+static void katana_mixer_private_free(struct usb_mixer_interface *mixer)
+{
+    struct katana_mixer_state *st = katana_get_state(mixer);
+    if (!st)
+        return;
+    cancel_delayed_work_sync(&st->vol_work);
+    kfree(st);
+    mixer->private_data = NULL;
+}
+
+static void katana_mixer_private_suspend(struct usb_mixer_interface *mixer)
+{
+    struct katana_mixer_state *st = katana_get_state(mixer);
+    if (!st)
+        return;
+    cancel_delayed_work_sync(&st->vol_work);
+    mutex_lock(&st->lock);
+    st->vol_pending = false;
+    st->vol_pending_steps = 0;
+    st->vol_cached_valid = false;
+    st->vol_cached_steps = 0;
+    mutex_unlock(&st->lock);
+}
+
+/* Katana UAC1 helpers (Interface 0, FU ID 1 => wIndex = 0x0100) */
+static inline int katana_uac1_get(struct usb_mixer_interface *mixer,
+                                  int request, u16 wValue,
+                                  void *buf, int len)
+{
+    struct snd_usb_audio *chip = mixer->chip;
+    int ret;
+
+    ret = snd_usb_lock_shutdown(chip);
+    if (ret < 0)
+        return ret;
+
+    ret = snd_usb_ctl_msg(chip->dev,
+                          usb_rcvctrlpipe(chip->dev, 0), request,
+                          USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
+                          wValue, 0x0100 /* IF=0, FU=1 */, buf, len);
+    snd_usb_unlock_shutdown(chip);
+    return ret;
+}
+
+static inline int katana_uac1_set(struct usb_mixer_interface *mixer,
+                                  int request, u16 wValue,
+                                  void *buf, int len)
+{
+    struct snd_usb_audio *chip = mixer->chip;
+    int ret;
+
+    ret = snd_usb_lock_shutdown(chip);
+    if (ret < 0)
+        return ret;
+
+    ret = snd_usb_ctl_msg(chip->dev,
+                          usb_sndctrlpipe(chip->dev, 0), request,
+                          USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_OUT,
+                          wValue, 0x0100 /* IF=0, FU=1 */, buf, len);
+    snd_usb_unlock_shutdown(chip);
+    return ret;
+}
+
+/* Query volume range (MIN/MAX/RES) on channel 1 */
+static int katana_get_volume_range(struct usb_mixer_interface *mixer,
+                                   s16 *minv, s16 *maxv, s16 *resv)
+{
+    u8 buf[2];
+    int ret;
+    s16 v;
+
+    ret = katana_uac1_get(mixer, UAC_GET_MIN, (UAC_FU_VOLUME << 8) | 0x01,
+                          buf, 2);
+    if (ret >= 2) {
+        v = (s16)((buf[1] << 8) | buf[0]);
+        *minv = v;
+    } else {
+        *minv = -20480;
+    }
+
+    ret = katana_uac1_get(mixer, UAC_GET_MAX, (UAC_FU_VOLUME << 8) | 0x01,
+                          buf, 2);
+    if (ret >= 2) {
+        v = (s16)((buf[1] << 8) | buf[0]);
+        *maxv = v;
+    } else {
+        *maxv = 0;
+    }
+
+    ret = katana_uac1_get(mixer, UAC_GET_RES, (UAC_FU_VOLUME << 8) | 0x01,
+                          buf, 2);
+    if (ret >= 2) {
+        v = (s16)((buf[1] << 8) | buf[0]);
+        *resv = v ? v : 1;
+    } else {
+        *resv = 1;
+    }
+
+    if (*resv == 0)
+        *resv = 1;
+    return 0;
+}
+
+/* No TLV: keep linear steps; avoid logarithmic scaling.
+ *
+ * Turns out that Katana's hardware has a much finer volume control
+ * than the what the display on the device shows, and ignoring TLV
+ * results in a much better experience.
+ */
+
+/* Katana Volume kcontrol callbacks */
+static int katana_vol_info(struct snd_kcontrol *kcontrol,
+                           struct snd_ctl_elem_info *uinfo)
+{
+    struct usb_mixer_elem_list *list = snd_kcontrol_chip(kcontrol);
+    struct usb_mixer_interface *mixer = list->mixer;
+    s16 minv = -20480, maxv = 0, resv = 1;
+
+    katana_get_volume_range(mixer, &minv, &maxv, &resv);
+
+    uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+    uinfo->count = 1;
+    uinfo->value.integer.min = 0;
+    uinfo->value.integer.max = (maxv - minv) / (resv ? resv : 1);
+    return 0;
+}
+
+static int katana_vol_get(struct snd_kcontrol *kcontrol,
+                          struct snd_ctl_elem_value *ucontrol)
+{
+    struct usb_mixer_elem_list *list = snd_kcontrol_chip(kcontrol);
+    struct usb_mixer_interface *mixer = list->mixer;
+    struct katana_mixer_state *st = katana_get_state(mixer);
+    s16 minv = -20480, maxv = 0, resv = 1;
+    u8 buf[2];
+    int ret;
+    s16 cur;
+
+    /* Prefer pending/cached values to avoid slow USB GETs */
+    if (st) {
+        mutex_lock(&st->lock);
+        if (st->vol_pending) {
+            ucontrol->value.integer.value[0] = st->vol_pending_steps;
+            mutex_unlock(&st->lock);
+            return 0;
+        }
+        if (st->vol_cached_valid) {
+            ucontrol->value.integer.value[0] = st->vol_cached_steps;
+            mutex_unlock(&st->lock);
+            return 0;
+        }
+        mutex_unlock(&st->lock);
+    }
+
+    katana_get_volume_range(mixer, &minv, &maxv, &resv);
+
+    ret = katana_uac1_get(mixer, UAC_GET_CUR, (UAC_FU_VOLUME << 8) | 0x01,
+                          buf, 2);
+    if (ret < 2) {
+        ucontrol->value.integer.value[0] = 0;
+        return 0;
+    }
+    cur = (s16)((buf[1] << 8) | buf[0]);
+    if (resv <= 0)
+        resv = 1;
+    if (cur <= minv)
+        ucontrol->value.integer.value[0] = 0;
+    else if (cur >= maxv)
+        ucontrol->value.integer.value[0] = (maxv - minv) / resv;
+    else
+        ucontrol->value.integer.value[0] = (cur - minv) / resv;
+    if (st) {
+        mutex_lock(&st->lock);
+        st->vol_cached_steps = ucontrol->value.integer.value[0];
+        st->vol_cached_valid = true;
+        mutex_unlock(&st->lock);
+    }
+    return 0;
+}
+
+static int katana_vol_put(struct snd_kcontrol *kcontrol,
+                          struct snd_ctl_elem_value *ucontrol)
+{
+    struct usb_mixer_elem_list *list = snd_kcontrol_chip(kcontrol);
+    struct usb_mixer_interface *mixer = list->mixer;
+    struct katana_mixer_state *st = katana_get_state(mixer);
+    int steps = ucontrol->value.integer.value[0];
+    int ret;
+
+    if (!st) {
+        /* State not initialized (shouldn't happen): do immediate write */
+        s16 minv = -20480, maxv = 0, resv = 1, raw;
+        u8 buf[2];
+        katana_get_volume_range(mixer, &minv, &maxv, &resv);
+        if (resv <= 0)
+            resv = 1;
+        raw = minv + (steps * resv);
+        if (raw < minv)
+            raw = minv;
+        if (raw > maxv)
+            raw = maxv;
+        buf[0] = (u8)(raw & 0xff);
+        buf[1] = (u8)((raw >> 8) & 0xff);
+        ret = katana_uac1_set(mixer, UAC_SET_CUR, (UAC_FU_VOLUME << 8) | 0x01, buf, 2);
+        if (ret < 0)
+            return ret;
+        ret = katana_uac1_set(mixer, UAC_SET_CUR, (UAC_FU_VOLUME << 8) | 0x02, buf, 2);
+        return ret < 0 ? ret : 1;
+    }
+
+    /* Avoid redundant writes; coalesce via delayed work */
+    mutex_lock(&st->lock);
+    if (st->vol_pending) {
+        if (steps == st->vol_pending_steps) {
+            mutex_unlock(&st->lock);
+            return 0;
+        }
+    } else if (st->vol_cached_valid) {
+        if (steps == st->vol_cached_steps) {
+            mutex_unlock(&st->lock);
+            return 0;
+        }
+    }
+    /* Update cache immediately so GET reflects new value without flicker */
+    st->vol_cached_steps = steps;
+    st->vol_cached_valid = true;
+    st->vol_pending_steps = steps;
+    st->vol_pending = true;
+    mutex_unlock(&st->lock);
+
+    mod_delayed_work(system_wq, &st->vol_work, msecs_to_jiffies(KATANA_VOL_DELAY_MS));
+    return 1;
+}
+
+/* Katana Mute kcontrol callbacks (device logic: 0=muted, 1=unmuted) */
+static int katana_mute_get(struct snd_kcontrol *kcontrol,
+                           struct snd_ctl_elem_value *ucontrol)
+{
+    struct usb_mixer_elem_list *list = snd_kcontrol_chip(kcontrol);
+    struct usb_mixer_interface *mixer = list->mixer;
+    u8 b;
+    int ret;
+
+    ret = katana_uac1_get(mixer, UAC_GET_CUR, (UAC_FU_MUTE << 8) | 0x00,
+                          &b, 1);
+    if (ret < 1) {
+        ucontrol->value.integer.value[0] = 1; /* default muted on error */
+        return 0;
+    }
+    /* Device: 0 = muted, 1 = unmuted; ALSA: 1 = muted, 0 = unmuted */
+    ucontrol->value.integer.value[0] = b ? 0 : 1;
+    return 0;
+}
+
+static int katana_mute_put(struct snd_kcontrol *kcontrol,
+                           struct snd_ctl_elem_value *ucontrol)
+{
+    struct usb_mixer_elem_list *list = snd_kcontrol_chip(kcontrol);
+    struct usb_mixer_interface *mixer = list->mixer;
+    u8 b;
+    int mute = ucontrol->value.integer.value[0] ? 1 : 0; /* ALSA 1=muted */
+    int ret;
+
+    /* Device expects inverted: 0=muted, 1=unmuted */
+    b = mute ? 0 : 1;
+    ret = katana_uac1_set(mixer, UAC_SET_CUR, (UAC_FU_MUTE << 8) | 0x00,
+                          &b, 1);
+    return ret < 0 ? ret : 1;
+}
+
+/* Kcontrol templates */
+static const struct snd_kcontrol_new snd_katana_vol_control = {
+    .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+    .name  = "Master Playback Volume",
+    .access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+    .info  = katana_vol_info,
+    .get   = katana_vol_get,
+    .put   = katana_vol_put,
+};
+
+static const struct snd_kcontrol_new snd_katana_mute_control = {
+    .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+    .name  = "Master Playback Switch",
+    .access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+    .info  = snd_ctl_boolean_mono_info,
+    .get   = katana_mute_get,
+    .put   = katana_mute_put,
+};
+
+static int snd_katana_controls_create(struct usb_mixer_interface *mixer)
+{
+    int err;
+    struct usb_mixer_elem_list *list;
+    struct katana_mixer_state *st;
+
+    /* Deactivate any generic FU(1) mute/volume the parser might have added */
+    for_each_mixer_elem(list, mixer, 1) {
+        struct usb_mixer_elem_info *cval = mixer_elem_list_to_info(list);
+        if (!list->kctl)
+            continue;
+        if (cval->control == UAC_FU_VOLUME || cval->control == UAC_FU_MUTE)
+            snd_ctl_activate_id(mixer->chip->card, &list->kctl->id, 0);
+    }
+
+    /* Add Katana controls bound under unit id 1 */
+    err = add_single_ctl_with_resume(mixer, 1, NULL,
+                                     &snd_katana_vol_control, &list);
+    if (err < 0)
+        return err;
+
+    err = add_single_ctl_with_resume(mixer, 1, NULL,
+                                     &snd_katana_mute_control, NULL);
+    if (err < 0)
+        return err;
+    /* Initialize state for deferred volume updates */
+    st = kzalloc(sizeof(*st), GFP_KERNEL);
+    if (st) {
+        st->mixer = mixer;
+        mutex_init(&st->lock);
+        INIT_DELAYED_WORK(&st->vol_work, katana_vol_work_func);
+        mixer->private_data = st;
+        mixer->private_free = katana_mixer_private_free;
+        mixer->private_suspend = katana_mixer_private_suspend;
+    }
+    return 0;
+}
+
 int snd_usb_mixer_apply_create_quirk(struct usb_mixer_interface *mixer)
 {
 	int err = 0;
@@ -4398,6 +4805,10 @@ int snd_usb_mixer_apply_create_quirk(struct usb_mixer_interface *mixer)
 				mixer,
 				snd_nativeinstruments_ta6_mixers,
 				ARRAY_SIZE(snd_nativeinstruments_ta6_mixers));
+		break;
+
+	case USB_ID(0x041e, 0x3247): /* Creative Sound Blaster X Katana */
+		err = snd_katana_controls_create(mixer);
 		break;
 
 	case USB_ID(0x17cc, 0x1021): /* Traktor Audio 10 */
